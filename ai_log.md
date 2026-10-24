@@ -62,6 +62,24 @@ fixed; I verified that a simulated bug now ends with exit code 1.
 
 ---
 
+## 2026-10-21 · Frankfurter v2 does return weekends
+
+**Asked:** what to expect when fetching BRL→USD/VND rates for a date range (2–9 Jan 2018) from
+Frankfurter, while practising lesson 13 (APIs) before writing `extract_fx.py`.
+**What went wrong:** The AI said some dates would be missing because the rates come from the
+European Central Bank, which does not publish on weekends. That was true for Frankfurter v1. The v2
+endpoint (`/v2/rates`) combines several sources and returned all 8 days, including Saturday 6 and
+Sunday 7 January.
+**How I caught it:** I called the API for the range and printed the dates per currency. The question
+about "missing" dates made no sense for what I saw, and the AI then called the same range itself and
+confirmed all 8 days were there.
+**Fix:** No code to fix: the wrong assumption was caught before `extract_fx.py` was written.
+**Lesson:** Check what the API actually returns instead of trusting a description of it, including an
+AI's. `extract_fx.py` must not assume which dates exist: it takes the dates from the response, and the
+join with orders has to handle a missing date explicitly.
+
+---
+
 ## Data incident (not AI) · 2026-10-12 · Excel changed the raw file
 
 `olist_orders_dataset.csv` had been opened in Excel and saved. Excel rewrote every timestamp as

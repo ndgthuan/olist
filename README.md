@@ -1,9 +1,9 @@
-# de_olist_pipeline
+# olist
 
 A batch data pipeline built on the [Olist Brazilian e-commerce dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce).
 It extracts CSVs and daily FX rates, loads them into PostgreSQL, models them with dbt and runs on a schedule.
 
-> Status: Phase 0 (project setup). Pipeline code arrives week by week.
+> Status: Week 2. Orders are cleaned (`clean_orders`) and BRL→USD/VND rates are extracted (`extract_fx`). Postgres, dbt and scheduling come next.
 
 ## How to set up
 
@@ -11,8 +11,8 @@ Requires Python 3.12+ and Git. Commands are for Windows PowerShell.
 
 1. **Clone the repo**
    ```powershell
-   git clone https://github.com/ndgthuan/de_olist_pipeline.git
-   cd de_olist_pipeline
+   git clone https://github.com/ndgthuan/olist.git
+   cd olist
    ```
 2. **Create and activate a virtual environment**
    ```powershell
@@ -29,17 +29,37 @@ Requires Python 3.12+ and Git. Commands are for Windows PowerShell.
    ```powershell
    Copy-Item .env.example .env
    ```
-6. **Run the tests**
+6. **Run the tests.** They use no network and no real data files.
    ```powershell
    python -m pytest
    ```
 
+If you move or rename the project folder, run step 3 again: the editable install remembers the old path.
+
+## How to run
+
+Run the steps in this order. `extract_fx` reads the date range from the clean orders file, so `clean_orders` must run first.
+
+```powershell
+python -m pipeline.clean_orders
+python -m pipeline.extract_fx
+```
+
+| Step | Reads | Writes | Log |
+|---|---|---|---|
+| `clean_orders` | `data/raw/olist/olist_orders_dataset.csv` | `data/processed/orders_clean.csv`, `data/rejects/orders_rejects.csv` | `logs/clean_orders.log` |
+| `extract_fx` | `data/processed/orders_clean.csv`, Frankfurter API | `data/raw/fx/fx_<start>_<end>.json`, `data/processed/fx_rates.csv` | `logs/extract_fx.log` |
+
+Each step ends with exit code 1 if it fails, so a scheduler can see the failure. The details are in the log file.
+
 ## Project layout
 
 ```text
-src/pipeline/   pipeline code (extract, transform, load, config)
+src/pipeline/   pipeline code, one module per step (clean_orders.py, extract_fx.py)
 tests/          pytest tests and tiny fixture files
-data/raw/olist/ downloaded CSVs (not in git)
+data/raw/       source data exactly as received: Olist CSVs and FX API responses (not in git)
+data/processed/ cleaned output (not in git)
+logs/           one log file per step (not in git)
 ```
 
 ## The data: what one row means
@@ -108,3 +128,56 @@ Reject file columns: `line` (line number in the source CSV), `order_id`, `reason
 - rows read = rows kept + rows rejected
 - `order_id` is unique in the clean file
 - the clean file is not empty
+
+## Cleaning rules: FX rates
+
+Daily exchange rates from [Frankfurter v2](https://frankfurter.dev/) (`/v2/rates`), used to convert order payments from BRL to USD and VND. One API call returns the whole range, so there is no pagination.
+
+### Date range
+
+The range is taken from the data, not hard-coded: the earliest and latest `order_purchase_timestamp` in `orders_clean.csv`, **plus one day on each side**.
+
+Why the extra days: the clean file is in UTC, but an order's business date is its São Paulo date. The first order was placed on 4 Sep 2016 at 21:15 in São Paulo, which is 5 Sep 00:15 UTC. Without the padding, its rate would be missing. Current range: `2016-09-04` to `2018-10-18`.
+
+### Request and retries
+
+| Failure | Retried? | Why |
+|---|---|---|
+| Timeout, connection error | Yes | The network often recovers within seconds |
+| HTTP 408, 425, 429, 5xx | Yes | The server is busy or failing; the same request may work later |
+| Other HTTP 4xx (for example 422 for an unknown currency) | No | The request itself is wrong; asking again gives the same answer |
+
+Up to 3 attempts, waiting 1 s then 2 s between them. Retrying is safe because the request is a GET: it only reads.
+
+### Rejected: the run fails
+
+The response is checked before anything is saved, so a broken response never replaces a good raw file.
+
+| Case |
+|---|
+| The response is not a list |
+| The response is empty |
+| A row has no `date` or no `quote` |
+| A row has a currency that was not requested |
+
+### Skipped, with a warning in the log
+
+| Case | Today |
+|---|---|
+| `rate` is missing or not a number | 0 |
+
+### Kept, with a warning in the log
+
+| Case | Today | Decision |
+|---|---|---|
+| A date where one currency has a rate and the other does not | 1: VND has no rate for 2017-07-15 (USD does). 119 orders were placed that day (UTC date) | Keep the rows that exist. The gap is filled when rates are joined to orders (below) |
+
+### Rule for the join with orders
+
+When an order's date has no rate for a currency, use the **latest earlier rate**, at most 3 days back. This is how banks and accounting treat days without a published rate, and FX moves little from one day to the next. The date the rate really comes from is kept in a `rate_date` column, so a filled rate is never presented as that day's rate. If the gap is longer than 3 days, the converted value stays empty and the run logs a warning. Leaving all gaps empty was rejected because sums would silently skip those orders and under-report revenue.
+
+### Files
+
+- Raw: the API response is saved byte for byte to `data/raw/fx/fx_<start>_<end>.json`.
+- Processed: `data/processed/fx_rates.csv` with columns `date`, `quote`, `rate` (one row per date and currency).
+- Both are written to a `.tmp` file first and then renamed, so a crash never leaves a half-written file.
