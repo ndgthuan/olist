@@ -5,6 +5,8 @@ import time
 import csv
 from datetime import date, timedelta
 from collections import Counter
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 URL = "https://api.frankfurter.dev/v2/rates"
 BASE_CURRENCY = "BRL"
@@ -17,6 +19,12 @@ FX_DIR = RAW_DIR / "fx"
 PROCESSED_DIR = DATA_DIR / "processed"
 FX_RATE_FILE = PROCESSED_DIR / "fx_rates.csv"
 ORDER_CLEAN_FILE = PROCESSED_DIR / "orders_clean.csv"
+FX_RATE_PARQUET_FILE = PROCESSED_DIR / "fx_rates.parquet"
+FX_SCHEMA = pa.schema([
+    pa.field("date", pa.date32(), nullable=False),
+    pa.field("quote", pa.string(), nullable=False),
+    pa.field("rate", pa.float64(), nullable=False),
+])
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_FILE = LOG_DIR / "extract_fx.log"
 OUTPUT_COLUMNS = ["date", "quote", "rate"]
@@ -128,6 +136,23 @@ def validate_rates(rows: list, quotes: list) -> None:
         if missing:
             logger.warning("%s has no rate for %d date(s): %s", q, len(missing), missing)
 
+def write_rates_parquet(rows: list, path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    good_rows = []
+    for row in rows:
+        if not isinstance(row.get("rate"), (int, float)):
+            continue
+        good_rows.append({
+            "date": date.fromisoformat(row["date"]),
+            "quote": row["quote"],
+            "rate": row["rate"],
+        })
+    table = pa.Table.from_pylist(good_rows, schema=FX_SCHEMA)
+    pq.write_table(table=table, where=tmp)
+    tmp.replace(path)
+    return len(good_rows)
+
 def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -147,6 +172,8 @@ def main() -> None:
         save_raw(response=response, path=FX_DIR / f"fx_{start}_{end}.json")
         PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         skipped , written = write_rates_csv(rows=rows, path=FX_RATE_FILE)
+        parquet_written = write_rates_parquet(rows=rows, path=FX_RATE_PARQUET_FILE)
+        logger.info("Wrote %d rows to %s", parquet_written, FX_RATE_PARQUET_FILE)
 
         logger.info("Rows written: %d", written)
         if skipped > 0:
