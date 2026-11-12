@@ -3,11 +3,11 @@
 A batch data pipeline built on the [Olist Brazilian e-commerce dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce).
 It extracts CSVs and daily FX rates, loads them into PostgreSQL, models them with dbt and runs on a schedule.
 
-> Status: Week 2 done. Orders are cleaned (`clean_orders`), BRL→USD/VND rates are extracted (`extract_fx`), and orders are joined with their items, payments and FX rates and reconciled against the raw files (`build_orders`). Postgres, dbt and scheduling come next.
+> Status: Week 3 done. Orders are cleaned (`clean_orders`), BRL→USD/VND rates are extracted (`extract_fx`), and orders are joined with their items, payments and FX rates and reconciled against the raw files (`build_orders`). All 9 CSVs are loaded into a Postgres `raw` schema running in Docker (`load_raw`). dbt and scheduling come next.
 
 ## How to set up
 
-Requires Python 3.12+ and Git. Commands are for Windows PowerShell.
+Requires Python 3.12+, Git and Docker Desktop (with Compose). Commands are for Windows PowerShell.
 
 1. **Clone the repo**
    ```powershell
@@ -25,11 +25,17 @@ Requires Python 3.12+ and Git. Commands are for Windows PowerShell.
    ```
 4. **Download the data.** Get the dataset from Kaggle (free account) and unzip the 9 CSVs into `data/raw/olist/`.
    The `data/` folder is git-ignored.
-5. **Copy the env file**
+5. **Copy the env file** and set your own `POSTGRES_PASSWORD` in `.env` (never commit `.env`).
    ```powershell
    Copy-Item .env.example .env
    ```
-6. **Run the tests.** They use no network and no real data files.
+6. **Start Postgres and create the raw schema.** Start Docker Desktop first. The data lives in the `olist_pgdata` volume, so it survives `docker compose down` (but not `down -v`).
+   ```powershell
+   docker compose up -d
+   docker compose ps          # wait for (healthy)
+   Get-Content sql/raw_schema.sql | docker exec -i olist_pg psql -U olist -d olist
+   ```
+7. **Run the tests.** They use no network and no real data files, except `test_load_raw.py`: it loads the real CSVs into Postgres twice, and is skipped when Postgres is not running.
    ```powershell
    python -m pytest
    ```
@@ -44,6 +50,7 @@ Run the steps in this order. `extract_fx` reads the date range from the clean or
 python -m pipeline.clean_orders
 python -m pipeline.extract_fx
 python -m pipeline.build_orders
+python -m pipeline.load_raw     # needs Postgres running (setup step 6)
 ```
 
 | Step | Reads | Writes | Log |
@@ -51,13 +58,17 @@ python -m pipeline.build_orders
 | `clean_orders` | `data/raw/olist/olist_orders_dataset.csv` | `data/processed/orders_clean.csv`, `data/rejects/orders_rejects.csv` | `logs/clean_orders.log` |
 | `extract_fx` | `data/processed/orders_clean.csv`, Frankfurter API | `data/raw/fx/fx_<start>_<end>.json`, `data/processed/fx_rates.csv`, `data/processed/fx_rates.parquet` | `logs/extract_fx.log` |
 | `build_orders` | `data/processed/orders_clean.csv`, `data/processed/fx_rates.parquet`, `data/raw/olist/olist_order_items_dataset.csv`, `data/raw/olist/olist_order_payments_dataset.csv` | nothing yet: it builds and checks the joined table in memory | `logs/build_orders.log` |
+| `load_raw` | the 9 CSVs in `data/raw/olist/` | the 9 tables in the Postgres `raw` schema | `logs/load_raw.log` |
 
 Each step ends with exit code 1 if it fails, so a scheduler can see the failure. The details are in the log file.
 
 ## Project layout
 
 ```text
-src/pipeline/   pipeline code, one module per step (clean_orders.py, extract_fx.py, build_orders.py)
+src/pipeline/   pipeline code, one module per step (clean_orders.py, extract_fx.py, build_orders.py, load_raw.py)
+                plus db.py: the Postgres connection, settings read from .env
+sql/            raw_schema.sql: the raw tables with their keys
+compose.yaml    the Postgres container (postgres:18, port 5432 on 127.0.0.1 only)
 tests/          pytest tests and tiny fixture files
 data/raw/       source data exactly as received: Olist CSVs and FX API responses (not in git)
 data/processed/ cleaned output (not in git)
@@ -236,3 +247,46 @@ Items and payments are both correct but do not measure the same thing: customers
 | **Total** | **165,318.88** |
 
 So revenue from payments and revenue from items are different numbers. Any report must say which one it uses.
+
+## Rules: load_raw
+
+`load_raw` copies the 9 Olist CSVs, unchanged, into the `raw` schema in Postgres. Column names match the source files, including the source's typos (`product_name_lenght`).
+
+### Keys (`sql/raw_schema.sql`)
+
+| Table | Primary key | Why |
+|---|---|---|
+| `order_items` | `order_id`, `order_item_id` | one row per item in an order |
+| `order_payments` | `order_id`, `payment_sequential` | one row per payment of an order |
+| `order_reviews` | `review_id`, `order_id` | `review_id` alone repeats: 814 review ids appear on more than one order |
+| `geolocation` | none | many rows per zip code, and 261,831 rows are exact duplicates |
+| the other 5 | their `_id` column | |
+
+Foreign keys link orders to customers, and items, payments and reviews to orders (items also to products and sellers). There is no foreign key from products to the category translation table: 2 categories (13 products) have no translation.
+
+### How a run works
+
+- **All or nothing.** One transaction: `TRUNCATE` all 9 tables, then `COPY` each file. If anything fails, everything is rolled back and the tables keep the previous run's data. They are never left empty or half-loaded.
+- **Safe to re-run (idempotent).** Every run replaces the full contents, so running it twice gives the same result. The files are full snapshots, so wipe-and-reload is correct. An upsert (`ON CONFLICT`) would never remove rows deleted at the source, and `geolocation` has no key to upsert on.
+- **Load order.** Parents before children (customers, sellers, products, translation, geolocation, then orders, then items, payments, reviews), so every foreign key finds its parent.
+- **Table names** are put into SQL with `psycopg.sql.Identifier`, never with f-strings.
+
+### Today
+
+| Table | Rows |
+|---|---|
+| customers | 99,441 |
+| sellers | 3,095 |
+| products | 32,951 |
+| product_category_name_translation | 71 |
+| geolocation | 1,000,163 |
+| orders | 99,441 |
+| order_items | 112,650 |
+| order_payments | 103,886 |
+| order_reviews | 99,224 |
+
+A full run takes about 7 seconds. Do not check these counts with a line count: 3,852 review messages contain line breaks inside quotes, so the reviews file has 104,163 lines for 99,224 rows.
+
+### Locking
+
+While a run is in progress, `TRUNCATE` holds the strongest lock on the raw tables, so other queries on them wait (about 7 seconds) and then see the new, complete data. That is fine at this size. For a long load, the usual fix is to load into a staging table and swap it in.
