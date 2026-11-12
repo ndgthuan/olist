@@ -41,6 +41,12 @@ def load_table(conn: psycopg.Connection, table: str, csv_path: Path) -> int:
     return row_count
 
 
+def truncate_all(conn: psycopg.Connection) -> None:
+    targets = sql.SQL(", ").join(sql.Identifier("raw", table)
+                                 for table, _ in TABLES)
+    conn.execute(sql.SQL("TRUNCATE {}").format(targets))
+
+
 def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -48,6 +54,7 @@ def main() -> None:
     try:
         started = time.perf_counter()
         with get_connection() as conn:
+            truncate_all(conn)
             for table, filename in TABLES:
                 row_count = load_table(conn, table, OLIST_DIR / filename)
                 logger.info("raw.%s rows: %d", table, row_count)
