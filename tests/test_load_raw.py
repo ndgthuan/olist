@@ -1,6 +1,6 @@
 """Integration test: needs the Postgres from compose.yaml running.
 
-Skipped (not failed) when the database is not reachable.
+Skipped (not failed) when the database is not reachable or the CSVs are missing.
 """
 
 import os
@@ -10,7 +10,7 @@ import pytest
 from psycopg import sql
 
 from pipeline.db import get_connection
-from pipeline.load_raw import TABLES, main
+from pipeline.load_raw import OLIST_DIR, TABLES, main
 
 # Give up after 3 s instead of hanging when Docker is off.
 os.environ.setdefault("PGCONNECT_TIMEOUT", "3")
@@ -36,7 +36,14 @@ def db_is_up() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(not db_is_up(), reason="Postgres not running (docker compose up -d)")
+def data_is_present() -> bool:
+    return all((OLIST_DIR / filename).exists() for _, filename in TABLES)
+
+
+pytestmark = [
+    pytest.mark.skipif(not db_is_up(), reason="Postgres not running (docker compose up -d)"),
+    pytest.mark.skipif(not data_is_present(), reason=f"Olist CSVs missing in {OLIST_DIR} (setup step 4)"),
+]
 
 
 def count_rows() -> dict[str, int]:

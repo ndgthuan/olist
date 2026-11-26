@@ -3,7 +3,7 @@
 A batch data pipeline built on the [Olist Brazilian e-commerce dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce).
 It extracts CSVs and daily FX rates, loads them into PostgreSQL, models them with dbt and runs on a schedule.
 
-> Status: Week 3 done. Orders are cleaned (`clean_orders`), BRL→USD/VND rates are extracted (`extract_fx`), and orders are joined with their items, payments and FX rates and reconciled against the raw files (`build_orders`). All 9 CSVs are loaded into a Postgres `raw` schema running in Docker (`load_raw`). dbt and scheduling come next.
+> Status: Week 4 done. Orders are cleaned (`clean_orders`), BRL→USD/VND rates are extracted (`extract_fx`), and orders are joined with their items, payments and FX rates and reconciled against the raw files (`build_orders`). All 9 CSVs are loaded into a Postgres `raw` schema running in Docker (`load_raw`), and 20 commented SQL queries analyse them (`sql/analysis/`). dbt and scheduling come next.
 
 ## How to set up
 
@@ -35,7 +35,7 @@ Requires Python 3.12+, Git and Docker Desktop (with Compose). Commands are for W
    docker compose ps          # wait for (healthy)
    Get-Content sql/raw_schema.sql | docker exec -i olist_pg psql -U olist -d olist
    ```
-7. **Run the tests.** They use no network and no real data files, except `test_load_raw.py`: it loads the real CSVs into Postgres twice, and is skipped when Postgres is not running.
+7. **Run the tests.** They use no network and no real data files, except `test_load_raw.py`: it loads the real CSVs into Postgres twice, and is skipped when Postgres is not running or the CSVs from step 4 are missing.
    ```powershell
    python -m pytest
    ```
@@ -68,12 +68,35 @@ Each step ends with exit code 1 if it fails, so a scheduler can see the failure.
 src/pipeline/   pipeline code, one module per step (clean_orders.py, extract_fx.py, build_orders.py, load_raw.py)
                 plus db.py: the Postgres connection, settings read from .env
 sql/            raw_schema.sql: the raw tables with their keys
+sql/analysis/   20 SQL queries on the raw tables, one question per file (see "SQL analysis")
 compose.yaml    the Postgres container (postgres:18, port 5432 on 127.0.0.1 only)
 tests/          pytest tests and tiny fixture files
 data/raw/       source data exactly as received: Olist CSVs and FX API responses (not in git)
 data/processed/ cleaned output (not in git)
 logs/           one log file per step (not in git)
 ```
+
+## SQL analysis
+
+`sql/analysis/` holds 20 queries on the `raw` tables, numbered in the order they were written. Each file starts with a header: the question, the grain (what one result row is), the expected result on this data, and the decisions behind it.
+
+Run one after `load_raw` (setup step 6 and How to run):
+
+```powershell
+Get-Content sql/analysis/04_late_rate_by_state.sql | docker exec -i olist_pg psql -U olist -d olist
+```
+
+Or open the file in any SQL client (DBeaver) connected to `localhost:5432`.
+
+| Files | Topic |
+|---|---|
+| 01–07 | CTEs and CASE: order status groups, payment types, late deliveries (by date, not timestamp), late rate by state, failed orders by month, repeat customers, late delivery vs review score |
+| 08–11 | Window functions: latest review per order (`ROW_NUMBER`), top 3 categories per state (`RANK`), ties in `ROW_NUMBER` / `RANK` / `DENSE_RANK` |
+| 12–14 | Time series: month-over-month with `LAG`, a `generate_series` calendar for months with no orders, 3-month rolling average |
+| 15–17 | The fan-out bug: joining items and payments directly inflates revenue by 27%; the fix (aggregate per order first); payment reconciliation |
+| 18–20 | `EXPLAIN ANALYZE`, an index on `orders.customer_id`, and an index the planner skips because the filter matches 97% of rows |
+
+19 and 20 create indexes (`CREATE INDEX IF NOT EXISTS`). They are not part of `raw_schema.sql` yet.
 
 ## The data: what one row means
 
